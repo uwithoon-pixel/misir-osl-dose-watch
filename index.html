@@ -23,6 +23,7 @@
 
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" onerror="window.__pdfFail=1"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <style>
 :root{
   --bg:#F4F6F6;
@@ -71,7 +72,11 @@ header.top .inner{max-width:1240px;margin:0 auto;padding:0 22px}
 .eyebrow{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#8FCFCB;font-weight:600}
 header.top h1{font-size:25px;margin:3px 0 3px;color:#fff}
 header.top .sub{font-size:13.5px;color:#B8DEDB;max-width:640px}
-.top-actions{display:flex;gap:8px;flex-wrap:wrap}
+.top-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.sync-badge{font-size:12px;padding:4px 10px;border-radius:999px;background:#eee;color:#555;white-space:nowrap}
+.sync-badge.sync-ok{background:#e3f5ea;color:#1B8A5A}
+.sync-badge.sync-saving{background:#fdf3d8;color:#8a6d1c}
+.sync-badge.sync-err{background:#fbe4e1;color:#C0392B}
 
 nav.tabs{display:flex;gap:2px;margin-top:20px;flex-wrap:wrap}
 nav.tabs button{
@@ -255,6 +260,7 @@ footer.foot{max-width:1240px;margin:0 auto;padding:22px;font-size:12px;color:var
         <div class="sub">เฝ้าระวังปริมาณรังสีประจำบุคคล เทียบกับ <b>Dose Constraints</b> รายไตรมาสและรายปี — หน่วยรังสีร่วมรักษา คณะแพทยศาสตร์ ม.สงขลานครินทร์</div>
       </div>
       <div class="top-actions no-print">
+        <span id="syncStatus" class="sync-badge">⚪ กำลังเชื่อมต่อ…</span>
         <button class="btn ghost" id="btnExport">สำรองข้อมูล</button>
         <button class="btn ghost" id="btnImport">กู้คืนข้อมูล</button>
         <input type="file" id="importFile" accept="application/json">
@@ -686,6 +692,28 @@ if(PDF_OK){
 }
 
 /* =================================================================
+   SUPABASE CONFIG — เชื่อมต่อฐานข้อมูลกลาง (ทุกคนเห็นข้อมูลเดียวกัน)
+================================================================= */
+const SUPABASE_URL = "https://kcsuljmxhcskayjyitmd.supabase.co";
+const SUPABASE_KEY = "sb_publishable_wezXSiPiogfmCQj3857gYA_XpRpu3lO";
+const SUPABASE_ROW_ID = "main"; // ทั้งระบบเก็บเป็นแถวเดียวชื่อ "main"
+
+let sb = null;
+try{
+  if(window.supabase && SUPABASE_URL && SUPABASE_KEY){
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  }
+}catch(e){ console.warn("Supabase init failed", e); }
+
+/* สถานะซิงค์ที่แสดงให้ผู้ใช้เห็น (มุมขวาบน) */
+function setSyncStatus(kind, text){
+  const el = document.getElementById("syncStatus");
+  if(!el) return;
+  el.textContent = text;
+  el.className = "sync-badge sync-" + kind;
+}
+
+/* =================================================================
    CONSTANTS
 ================================================================= */
 const STORAGE_KEY = "misir_osl_dose_v2";
@@ -828,7 +856,83 @@ try{
   }
 }catch(e){ state = freshState(); }
 
-function saveState(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){ console.warn(e); } }
+/* =================================================================
+   SUPABASE SYNC
+   - โหลดครั้งแรกจาก localStorage ทันที (หน้าจอไม่ค้างรอเน็ต)
+   - แล้วดึงจาก Supabase มาทับถ้ามีข้อมูลใหม่กว่า / มีอยู่แล้ว
+   - ทุกครั้งที่ saveState() ถูกเรียก จะเขียนลง localStorage ทันที
+     และส่งขึ้น Supabase แบบหน่วงเวลา (debounce) กันยิง API ถี่เกินไป
+================================================================= */
+let _pushTimer = null;
+let _remoteLoaded = false; // true เมื่อดึงข้อมูลจาก Supabase มาแล้วอย่างน้อย 1 ครั้ง
+
+function saveState(){
+  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){ console.warn(e); }
+  schedulePush();
+}
+
+function schedulePush(){
+  if(!sb) return; // ไม่ได้ตั้งค่า Supabase — ทำงานแบบเดิม (localStorage อย่างเดียว)
+  setSyncStatus("saving","🟡 กำลังบันทึก…");
+  clearTimeout(_pushTimer);
+  _pushTimer = setTimeout(pushStateToSupabase, 800);
+}
+
+async function pushStateToSupabase(){
+  if(!sb) return;
+  try{
+    const{error}=await sb.from("app_state").upsert({
+      id: SUPABASE_ROW_ID,
+      data: state,
+      updated_at: new Date().toISOString()
+    });
+    if(error) throw error;
+    setSyncStatus("ok","🟢 บันทึกแล้ว");
+  }catch(e){
+    console.warn("Supabase push failed", e);
+    setSyncStatus("err","🔴 บันทึกไม่สำเร็จ (ออฟไลน์?)");
+  }
+}
+
+async function loadStateFromSupabase(){
+  if(!sb) return;
+  setSyncStatus("saving","🟡 กำลังโหลดข้อมูล…");
+  try{
+    const{data,error}=await sb.from("app_state").select("data").eq("id",SUPABASE_ROW_ID).maybeSingle();
+    if(error) throw error;
+    if(data && data.data){
+      state = data.data;
+      if(!state.constraints) state.constraints = JSON.parse(JSON.stringify(DEFAULT_CONSTRAINTS));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      renderAll();
+    } else {
+      /* ยังไม่มีแถวใน Supabase เลย — สร้างแถวแรกจากข้อมูลปัจจุบันของเครื่องนี้ */
+      await pushStateToSupabase();
+    }
+    _remoteLoaded = true;
+    setSyncStatus("ok","🟢 เชื่อมต่อแล้ว");
+  }catch(e){
+    console.warn("Supabase load failed", e);
+    setSyncStatus("err","🔴 เชื่อมต่อไม่ได้ (ใช้ข้อมูลในเครื่องนี้แทน)");
+  }
+}
+
+/* ฟังการเปลี่ยนแปลงจากเครื่อง/ผู้ใช้อื่นแบบเรียลไทม์ */
+function subscribeRealtime(){
+  if(!sb) return;
+  sb.channel("app_state_changes")
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"app_state",filter:`id=eq.${SUPABASE_ROW_ID}`},
+      payload=>{
+        if(payload.new && payload.new.data){
+          state = payload.new.data;
+          if(!state.constraints) state.constraints = JSON.parse(JSON.stringify(DEFAULT_CONSTRAINTS));
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          renderAll();
+          setSyncStatus("ok","🟢 อัปเดตจากเครื่องอื่น");
+        }
+      })
+    .subscribe();
+}
 
 function rosterOf(name){ return state.roster.find(x=>x.name===name) || null; }
 function positionOf(name){
@@ -2471,9 +2575,17 @@ function fixGrids(){
 window.addEventListener("resize",fixGrids);
 
 applySupLock();
-saveState();
 renderAll();
 fixGrids();
+
+/* เชื่อมต่อ Supabase (ถ้าตั้งค่าไว้): โหลดข้อมูลกลางมาทับของในเครื่อง แล้วฟังการอัปเดตแบบเรียลไทม์
+   หมายเหตุ: ไม่เรียก saveState() ตรงนี้ เพื่อไม่ให้ข้อมูลเก่าในเครื่องไปทับข้อมูลกลางโดยไม่ตั้งใจ
+   ก่อนที่จะโหลดข้อมูลจาก Supabase เสร็จ */
+if(sb){
+  loadStateFromSupabase().then(subscribeRealtime);
+} else {
+  setSyncStatus("err","⚪ ไม่ได้เชื่อมต่อฐานข้อมูลกลาง (โหมดออฟไลน์)");
+}
 
 </script>
 </body>
